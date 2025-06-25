@@ -1,7 +1,8 @@
+#Neccessary Libraries for Quantum Computing Simulation and Data Cleaning
 import pandas as pd
 import numpy as np
 import pennylane as qml
-from pennylane import numpy as np
+from pennylane import numpy as np 
 from pennylane.optimize import AdamOptimizer
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
@@ -21,15 +22,15 @@ except ImportError:
 # Print Pennylane version for debugging
 print(f"Pennylane version: {pennylane.__version__}")
 
-# --- 1. Configuration ---
-INPUT_FILENAME = 'qml_ohiostate_enhanced.csv'
-NUM_QUBITS = 13  # Matches 13 features
+# 1. Configuration: Setting up qunatum circuits size layers
+INPUT_FILENAME = 'Big Ten.csv' #Play-by-Play Data from the 2023 Season
+NUM_QUBITS = 10  # Matches 10 features
 NUM_LAYERS = 6   # For data re-uploading
 DEV = qml.device('default.qubit', wires=NUM_QUBITS)
 SEED = 42
 np.random.seed(SEED)
 
-print("--- Starting QML Prediction for Ohio State Play Type (Extended Features) ---")
+print("--- Starting QML Prediction for Ohio State Play Type ---")
 
 # --- 2. Data Loading and Preprocessing ---
 try:
@@ -38,6 +39,10 @@ try:
 except FileNotFoundError:
     print(f"ERROR: '{INPUT_FILENAME}' not found. Ensure the file exists in the working directory.")
     exit()
+
+# Filter for Ohio State offensive plays
+df = df[df['offense_play'] == 'Ohio State'].copy()
+print(f"Filtered to {len(df)} Ohio State offensive plays.")
 
 # Filter for pass and run plays only
 valid_plays = df['play_type'].isin(['Rush', 'Pass Reception', 'Pass Incompletion', 'Passing Touchdown', 'Rushing Touchdown'])
@@ -51,11 +56,15 @@ df['play_type_numeric'] = df['play_type'].apply(lambda x: 1 if x in ['Pass Recep
 if 'ScoreDiff' not in df.columns:
     df['ScoreDiff'] = df['offense_score'] - df['defense_score']
 
-# Features selection (extended set)
+# Extract features from play_text
+df['shotgun'] = df['play_text'].apply(lambda x: 1 if isinstance(x, str) and 'shotgun' in x.lower() else 0)
+df['no_huddle'] = df['play_text'].apply(lambda x: 1 if isinstance(x, str) and 'no huddle' in x.lower() else 0)
+print(f"Extracted 'shotgun' and 'no_huddle' from play_text.")
+
+# Features selection
 features = [
     'period', 'down', 'yards_to_goal', 'distance', 'ScoreDiff',
-    'ppa', 'drive_time_minutes_elapsed', 'drive_time_seconds_elapsed',
-    'offense_timeouts', 'defense_timeouts', 'shotgun', 'play_action', 'no_huddle'
+    'ppa', 'offense_timeouts', 'defense_timeouts', 'shotgun', 'no_huddle'
 ]
 X = df[features].copy()
 
@@ -78,20 +87,12 @@ scaler = MinMaxScaler(feature_range=(0, np.pi))
 X_scaled = scaler.fit_transform(X)
 print(f"X_scaled shape: {X_scaled.shape}")
 
-# Split data
-X_train, X_test, y_train, y_test = train_test_split(
-    X_scaled, y, test_size=0.2, random_state=SEED, stratify=y
+# Split data and get test indices
+df_indices = df.index.values  # Indices of filtered DataFrame
+X_train, X_test, y_train, y_test, train_idx, test_idx = train_test_split(
+    X_scaled, y, df_indices, test_size=0.2, random_state=SEED, stratify=y
 )
 print(f"Training set: {len(X_train)} samples, Test set: {len(X_test)} samples")
-
-# Feature importance analysis
-print("\n--- Feature Importance Analysis ---")
-rf_temp = RandomForestClassifier(n_estimators=100, random_state=SEED)
-rf_temp.fit(X_scaled, y)
-importances = rf_temp.feature_importances_
-feature_importance = pd.DataFrame({'Feature': features, 'Importance': importances})
-feature_importance = feature_importance.sort_values(by='Importance', ascending=False)
-print(feature_importance)
 
 # Convert labels to {-1.0, 1.0} floats for quantum circuit
 y_train_pm = np.array([1.0 if label == 1 else -1.0 for label in y_train])
@@ -143,7 +144,7 @@ for step in range(num_steps):
     y_batch = y_train_pm[indices]
 
     # Optimize weights and bias
-    weights, bias = opt.step(cost, weights, bias, X=X_batch, y=y_batch)
+    weights, bias = opt.step(lambda w, b: cost(w, b, X_batch, y_batch), weights, bias)
 
     if step % 10 == 0 or step == num_steps - 1:
         train_preds = np.array([variational_classifier(weights, bias, x) for x in X_train])
@@ -156,7 +157,8 @@ for step in range(num_steps):
 
 # Final evaluation
 vqc_test_preds = np.sign([variational_classifier(weights, bias, x) for x in X_test])
-vqc_accuracy = accuracy_score(y_test, (vqc_test_preds + 1) / 2)  # Convert {-1,1} to {0,1}
+vqc_test_preds_binary = (vqc_test_preds + 1) / 2  # Convert {-1,1} to {0,1}
+vqc_accuracy = accuracy_score(y_test, vqc_test_preds_binary)
 print(f"\nVQC Final Test Accuracy: {vqc_accuracy:.4f}")
 
 # --- 4. Quantum Kernel Method ---
@@ -194,6 +196,7 @@ try:
 except Exception as e:
     print(f"ERROR in Quantum Kernel SVM: {e}")
     kernel_accuracy = None
+    kernel_preds = np.zeros_like(y_test)  # Dummy predictions for output
 
 # --- 5. Classical Baseline (Random Forest) ---
 print("\n--- Training Classical Random Forest ---")
@@ -203,7 +206,26 @@ rf_preds = rf.predict(X_test)
 rf_accuracy = accuracy_score(y_test, rf_preds)
 print(f"Random Forest Test Accuracy: {rf_accuracy:.4f}")
 
-# --- 6. Plotting Results (Optional) ---
+# --- 6. Prediction Analysis ---
+print("\n--- Saving Prediction Results ---")
+results = pd.DataFrame({
+    'Test_Index': test_idx,
+    'True_Label': y_test,
+    'VQC_Prediction': vqc_test_preds_binary,
+    'VQC_Correct': y_test == vqc_test_preds_binary,
+    'Kernel_SVM_Prediction': kernel_preds,
+    'Kernel_SVM_Correct': y_test == kernel_preds,
+    'RF_Prediction': rf_preds,
+    'RF_Correct': y_test == rf_preds
+})
+results['True_Label'] = results['True_Label'].map({0: 'Run', 1: 'Pass'})
+results['VQC_Prediction'] = results['VQC_Prediction'].map({0: 'Run', 1: 'Pass'})
+results['Kernel_SVM_Prediction'] = results['Kernel_SVM_Prediction'].map({0: 'Run', 1: 'Pass'})
+results['RF_Prediction'] = results['RF_Prediction'].map({0: 'Run', 1: 'Pass'})
+results.to_csv('prediction_results.csv', index=False)
+print("Prediction results saved to 'prediction_results.csv'")
+
+# --- 7. Plotting Results (Optional) ---
 if PLOTTING_AVAILABLE:
     plt.figure(figsize=(10, 6))
     steps = list(range(0, num_steps, 10))
@@ -216,11 +238,11 @@ if PLOTTING_AVAILABLE:
         plt.axhline(y=kernel_accuracy, color='g', linestyle='--', label=f'Quantum Kernel SVM Accuracy ({kernel_accuracy:.4f})')
     plt.xlabel('Training Step')
     plt.ylabel('Accuracy')
-    plt.title('Ohio State Play Type Prediction Performance (Extended Features)')
+    plt.title('Ohio State Play Type Prediction Performance')
     plt.legend()
     plt.grid(True)
     plt.ylim(0.4, 1.0)
-    plt.savefig("ohiostate_model_performance_extended.png")
-    print("\nPlot saved to ohiostate_model_performance_extended.png")
+    plt.savefig("ohiostate_model_performance.png")
+    print("\nPlot saved to ohiostate_model_performance.png")
 else:
     print("\nSkipping plot generation due to missing matplotlib.")
